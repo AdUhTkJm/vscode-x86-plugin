@@ -16,7 +16,7 @@ export function activate(context: vsc.ExtensionContext) {
   const clientOpt: lsp.LanguageClientOptions = {
     documentSelector: [
       { scheme: "file", language: "nasm-x86" }
-    ]
+    ],
   };
 
   client = new lsp.LanguageClient("x86.client", "NASM X86 Client", serverOpt, clientOpt);
