@@ -6,7 +6,6 @@ let client: lsp.LanguageClient;
 
 export function activate(context: vsc.ExtensionContext) {
   const serverPath = context.asAbsolutePath(path.join("dist", "server.js"));
-  vsc.window.showInformationMessage(`NASM X86 extension is enabled.`);
 
   const serverOpt: lsp.ServerOptions = {
     run: { module: serverPath },

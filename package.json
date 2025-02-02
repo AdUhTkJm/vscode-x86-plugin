@@ -14,12 +14,6 @@
   ],
   "main": "./dist/client.js",
   "contributes": {
-    "commands": [
-      {
-        "title": "Hello World",
-        "command": "nasm-x86.helloworld"
-      }
-    ],
     "languages": [
       {
         "id": "nasm-x86",

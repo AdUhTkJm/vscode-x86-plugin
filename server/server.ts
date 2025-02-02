@@ -7,14 +7,31 @@ import * as doc from 'vscode-languageserver-textdocument';
 
 const instructions = [
 	// Arithmetic operations
-	"add", "sub", "mov",
+	"adc", "and", "add", "bsf",
+	"bsr", "bt", "btr", "bts", "cmp",
+	"cmpsb", "cmpsd", "cmpsq", "cmpsw",
+	"cupid", "cwd", "cdq", "cdo",
+	"dec", "div", "idiv", "imul", "lahf",
+	"lea", "lodsb", "lodsw", "lodsd", "lodsq",
+	"mov", "movsx", "movsxd", "movzx",
+	"mul", "neg", "not", "or", "pop",
+	"popfq", "push", "pushfq", "rcl", "rcr",
+	"rep", "repe", "repz", "repne", "repnz",
+	"rol", "ror", "sahf", "sar", "setcc",
+	"shl", "shr", "sbb", "std",
+	"stosb", "stosw", "stosd", "stosq",
+	"test", "xchg", "xor",
 
 	// Branch instructions
 	"jl", "jg", "ja", "jb",
-	"jle", "jge",
-
-	// Jump instructions
+	"jle", "jge", "jae", "jbe",
+	"jne", "js", "jns", "jp", "jnp",
+	"jc", "jnc", "jo", "jno",
 	"jmp",
+
+	// Conditional movements
+	"cmovl", "cmovg", "cmova", "cmovb",
+	"cmovle", "cmovge",
 
 	// Function calls
 	"call", "ret",
@@ -22,13 +39,41 @@ const instructions = [
 
 const registers = [
 	// 64-bit
-	"rax", "rbx",
+	"rax", "rbx", "rcx", "rdx",
+	"rdi", "rsi", "rbp", "rsp",
+	"r8", "r9", "r10", "r11",
+	"r12", "r13", "r14", "r15",
 
 	// 32-bit
-	"eax", "ebx",
+	"eax", "ebx", "ecx", "edx",
+	"edi", "esi", "ebp", "esp",
+	"r8d", "r9d", "r10d", "r11d",
+	"r12d", "r13d", "r14d", "r15d",
+
+	// 16-bit
+	"ax", "bx", "cx", "dx",
+	"di", "si", "bp", "sp",
+	"r8w", "r9w", "r10w", "r11w",
+	"r12w", "r13w", "r14w", "r15w",
+
+	// 8-bit
+	"al", "bl", "cl", "dl",
+	"dil", "sil", "bpl", "spl",
+	"r8b", "r9b", "r10b", "r11b",
+	"r12b", "r13b", "r14b", "r15b",
 ];
 
-const tokenTypesLegend = ["keyword", "function", "variable", "number", "label"];
+const types = [
+	"dword", "qword", "word", "byte"
+];
+
+const directives = [
+	"global",
+	
+	"section", "text", "data", "bss",
+];
+
+const tokenTypesLegend = ["keyword", "function", "variable", "number", "comment", "type", "macro"];
 const tokenModifiersLegend = ["declaration", "readonly", "deprecated"];
 
 const tokenTypes: { [x: string]: number } = {};
@@ -66,6 +111,7 @@ connection.onInitialize((params: lsp.InitializeParams) => {
 					tokenTypes: tokenTypesLegend,
 					tokenModifiers: tokenModifiersLegend,
 				},
+				range: false,
 				full: {
 					delta: true
 				}
@@ -189,6 +235,12 @@ function computeSemanticTokens(uri: string) {
         while (i < line.length) {
             let remains = line.slice(i);
 
+			// comment
+			if (remains.startsWith(";")) {
+				tokens.push(line_no, i, remains.length, tokenTypes.comment, 0);
+				break;
+			}
+
             // digit (immediate)
             let matchImm = remains.match(/^\d+/);
             if (matchImm) {
@@ -199,20 +251,25 @@ function computeSemanticTokens(uri: string) {
             }
 
             // identifier (register or operation)
-            let matchId = remains.match(/^\w+/);
+            let matchId = remains.match(/^[_\w]+/);
             if (matchId) {
                 let str = matchId[0];
 				tokens.push(line_no, i, str.length);
 
 				if (instructions.includes(str))
-					tokens.push(tokenTypes.keyword, 0);
+				 	tokens.push(tokenTypes.keyword, 0);
 				
 				else if (registers.includes(str))
 					tokens.push(tokenTypes.variable, 0);
 
-				// Otherwise, this is a label
+				else if (types.includes(str))
+					tokens.push(tokenTypes.type, 0);
+
+				else if (directives.includes(str))
+					tokens.push(tokenTypes.macro, 0);
+
 				else
-					tokens.push(tokenTypes.label, 0);
+					tokens.push(tokenTypes.function, 0);
 
                 i += str.length;
                 continue;
@@ -222,7 +279,30 @@ function computeSemanticTokens(uri: string) {
             i++;
         }
 	});
-	return tokens;
+	
+	// we must convert them to relative position.
+	// the original array is already sorted according to (line, char_start).
+	let currentLine = 0;
+	let currentChar = 0;
+
+	let relative = [];
+
+	for (let i = 0; i < tokens.length; i += 5) {
+		let line_no = tokens[i];
+		let start = tokens[i + 1];
+
+		let deltaLine = line_no - currentLine;
+		if (deltaLine > 0) {
+			currentLine = line_no;
+			currentChar = 0;
+		}
+
+		let deltaStart = start - currentChar;
+		currentChar = start;
+
+		relative.push(deltaLine, deltaStart, tokens[i + 2], tokens[i + 3], tokens[i + 4]);
+	}
+	return relative;
 }
 
 function computeTokenDelta(before: number[], after: number[]) {
