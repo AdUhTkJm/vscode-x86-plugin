@@ -6,8 +6,7 @@ import * as lsp from 'vscode-languageserver/node';
 import * as doc from 'vscode-languageserver-textdocument';
 import { parse } from 'path';
 
-const instructions = [
-	// Arithmetic operations
+const arith = [
 	"adc", "and", "add", "bsf",
 	"bsr", "bt", "btr", "bts", "cmp",
 	"cmpsb", "cmpsd", "cmpsq", "cmpsw",
@@ -22,20 +21,27 @@ const instructions = [
 	"shl", "shr", "sbb", "std",
 	"stosb", "stosw", "stosd", "stosq",
 	"test", "xchg", "xor",
+];
 
-	// Branch instructions
+const branch = [	
 	"jl", "jg", "ja", "jb",
 	"jle", "jge", "jae", "jbe",
 	"jne", "js", "jns", "jp", "jnp",
 	"jc", "jnc", "jo", "jno",
 	"jmp",
 
-	// Conditional movements
+	"call", "ret",
+];
+
+const cond_move = [
 	"cmovl", "cmovg", "cmova", "cmovb",
 	"cmovle", "cmovge",
+];
 
-	// Function calls
-	"call", "ret",
+const instructions = [
+	...arith,
+	...branch,
+	...cond_move,
 ];
 
 const registers = [
@@ -177,6 +183,7 @@ class Instruction {
 
 	head() { return this.operands[0]; }
 	length() { return this.operands.length; }
+	last() { return this.operands[this.operands.length - 1]; }
 }
 
 class Diagnostic {
@@ -267,13 +274,16 @@ async function sendDiagnostics(source: doc.TextDocument): Promise<lsp.Diagnostic
 
 function splitLine(tokens: Token[]): Instruction[] {
 	// Split each line.
-	let lines = [];
-	let curInst = [];
-	let curLine = 0;
+	let lines: Token[][] = [];
+	let curInst: Token[] = [];
+	let curLine = -1;
 	for (let x of tokens) {
 		if (x.line_no !== curLine) {
 			curLine = x.line_no;
-			lines.push(curInst);
+			if (curInst.length > 0) {
+				lines.push(curInst);
+				curInst = [];
+			}
 		}
 
 		// Remove comments.
@@ -281,43 +291,75 @@ function splitLine(tokens: Token[]): Instruction[] {
 			curInst.push(x);
 	}
 	// The final push is not done yet, do it now
-	lines.push(curInst);
+	if (tokens.length > 0)
+		lines.push(curInst);
 
 	return lines.map((x) => new Instruction(x));
 }
 
-let labels = [];
+let labels = new Set<String>();
+
+/**
+ * Add an error to `diagnostics`.
+ */
+function addError(msg: string, start: Token, end?: Token): void {
+	diagnostics!.push(new Diagnostic(lsp.DiagnosticSeverity.Error, msg, start, end));
+}
 
 // We don't need AST, as x86 is quite straightforward.
 function semanticsAnalysis(tokens: Token[]) {
 	let inst = splitLine(tokens);
-	if (diagnostics === null)
+	if (!diagnostics)
 		diagnostics = [];
 
 	for (let x of inst) {
-		let type = x.head().type;
+		let head = x.head();
+		let type = head.type;
 
 		// An instruction.
 		if (type === tokenTypes.keyword) {
+			// Branch instructions, except `ret`, should have
+			// a label operand
+			if (branch.includes(head.value)) {
+				let op_count = 1;
+				let erratic = false;
+				if (head.value === "ret")
+					op_count = 0;
 
+				// Note x.length() contains the head (instruction mnemonic) itself
+				if (x.length() > 1 + op_count)
+					erratic = true,
+					addError(`excess operand; only ${op_count} expected`, x.operands[op_count], x.last());
+
+				if (x.length() < 1 + op_count)
+					erratic = true,
+					addError(`missing operand; ${op_count} expected`, head);
+
+				if (op_count === 1 && !labels.has(x.operands[1].value))
+					erratic = true,
+					addError("unknown label", x.operands[1]);
+				
+				if (!erratic && op_count === 1)
+					x.operands[1].type = tokenTypes.function;
+			}
 		}
 
 		// Probably a label.
 		if (type === -1) {
 			// Expect a colon and nothing else.
 			if (x.length() > 2) {
-				diagnostics.push(new Diagnostic(lsp.DiagnosticSeverity.Error, "unexpected content after label", x.operands[2], x.operands[x.length() - 1]));
+				addError("unexpected content after label", x.operands[2], x.last());
 				continue;
 			}
 
 			// Must have a colon after it
 			if (x.length() === 1 || x.operands[1].value !== ":") {
-				diagnostics.push(new Diagnostic(lsp.DiagnosticSeverity.Error, "missing semicolon for labels", x.head()));
+				addError("missing semicolon for labels", head);
 				continue;
 			}
 
-			labels.push(x.head());
-			x.head().type = tokenTypes.function;
+			labels.add(head.value);
+			head.type = tokenTypes.function;
 		}
 	}
 }
