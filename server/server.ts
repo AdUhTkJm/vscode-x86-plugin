@@ -4,6 +4,7 @@
  * ------------------------------------------------------------------------------------------ */
 import * as lsp from 'vscode-languageserver/node';
 import * as doc from 'vscode-languageserver-textdocument';
+import { parse } from 'path';
 
 const instructions = [
 	// Arithmetic operations
@@ -73,7 +74,10 @@ const directives = [
 	"section", "text", "data", "bss",
 ];
 
-const tokenTypesLegend = ["keyword", "function", "variable", "number", "comment", "type", "macro"];
+const tokenTypesLegend = [
+	"keyword", "function", "variable", "number",
+	"comment", "type", "macro", "operator"
+];
 const tokenModifiersLegend = ["declaration", "readonly", "deprecated"];
 
 const tokenTypes: { [x: string]: number } = {};
@@ -126,72 +130,6 @@ connection.onInitialized(() => {
 	connection.console.log("NASM X86 LSP initialized.");
 });
 
-// The example settings
-interface ExampleSettings {
-	maxNumberOfProblems: number;
-}
-
-connection.languages.diagnostics.on(async (params) => {
-	const document = documents.get(params.textDocument.uri);
-	if (document !== undefined) {
-		return {
-			kind: lsp.DocumentDiagnosticReportKind.Full,
-			items: await validateTextDocument(document)
-		} satisfies lsp.DocumentDiagnosticReport;
-	} else {
-		return {
-			kind: lsp.DocumentDiagnosticReportKind.Full,
-			items: []
-		} satisfies lsp.DocumentDiagnosticReport;
-	}
-});
-
-// The content of a text document has changed. This event is emitted
-// when the text document first opened or when its content has changed.
-documents.onDidChangeContent(change => {
-	validateTextDocument(change.document);
-});
-
-async function validateTextDocument(textDocument: doc.TextDocument): Promise<lsp.Diagnostic[]> {
-	// The validator creates diagnostics for all uppercase words length 2 and more
-	const text = textDocument.getText();
-	const pattern = /\b[A-Z]{2,}\b/g;
-	let m: RegExpExecArray | null;
-
-	let problems = 0;
-	const diagnostics: lsp.Diagnostic[] = [];
-	while ((m = pattern.exec(text)) && problems < 10) {
-		problems++;
-		const diagnostic: lsp.Diagnostic = {
-			severity: lsp.DiagnosticSeverity.Warning,
-			range: {
-				start: textDocument.positionAt(m.index),
-				end: textDocument.positionAt(m.index + m[0].length)
-			},
-			message: `${m[0]} is all uppercase.`,
-			source: 'ex'
-		};
-		diagnostic.relatedInformation = [
-			{
-				location: {
-					uri: textDocument.uri,
-					range: Object.assign({}, diagnostic.range)
-				},
-				message: 'Spelling matters'
-			},
-			{
-				location: {
-					uri: textDocument.uri,
-					range: Object.assign({}, diagnostic.range)
-				},
-				message: 'Particularly for names'
-			}
-		];
-		diagnostics.push(diagnostic);
-	}
-	return diagnostics;
-}
-
 connection.onCompletion((_textPos: lsp.TextDocumentPositionParams): lsp.CompletionItem[] => {
 	if (!hasCompletion)
 		return [];
@@ -212,21 +150,182 @@ connection.onDidChangeWatchedFiles(_change => {
 
 const prevTokens = new Map<string, number[]>();
 
+class Token {
+	line_no: number;
+	start: number;
+	type: number;
+	modif: number;
+	value: string;
+
+	constructor(line_no: number, start: number, value: string, type: number, modif: number) {
+		this.line_no = line_no;
+		this.start = start;
+		this.value = value;
+		this.type = type;
+		this.modif = modif;
+	}
+
+	length() { return this.value.length; }
+}
+
+class Instruction {
+	operands: Token[];
+
+	constructor(operands: Token[]) {
+		this.operands = operands;
+	}
+
+	head() { return this.operands[0]; }
+	length() { return this.operands.length; }
+}
+
+class Diagnostic {
+	level: lsp.DiagnosticSeverity;
+	message: string;
+	start: doc.Position;
+	end: doc.Position;
+	relatedInfo: string[];
+
+	constructor(level: lsp.DiagnosticSeverity, message: string, begin: Token, end?: Token, relatedInfo?: string[]) {
+		// If only `begin` is provided, then this is for single token
+		end = end ?? begin;
+
+		this.level = level;
+		this.message = message;
+		this.start = { line: begin.line_no, character: begin.start };
+		this.end = { line: end.line_no, character: end.start + end.length() };
+		this.relatedInfo = relatedInfo ?? [];
+	}
+}
+
+connection.languages.diagnostics.on(async (params) => {
+	const document = documents.get(params.textDocument.uri);
+	if (document !== undefined) {
+		return {
+			kind: lsp.DocumentDiagnosticReportKind.Full,
+			items: await sendDiagnostics(document)
+		} satisfies lsp.DocumentDiagnosticReport;
+	} else {
+		return {
+			kind: lsp.DocumentDiagnosticReportKind.Full,
+			items: []
+		} satisfies lsp.DocumentDiagnosticReport;
+	}
+});
+
+// The content of a text document has changed. This event is emitted
+// when the text document first opened or when its content has changed.
+documents.onDidChangeContent(change => {
+	sendDiagnostics(change.document);
+});
+
+let diagnostics: Diagnostic[] | null = null;
+
 /**
+ * Read from global variable `diagnostics` and convert them to the format
+ * which the client can understand.
  * 
- * @return the format is a one-dimensional array, where each token
- * is represented by 5 consecutive integers:
- * 
- * - **line**: line of this token
- * - **startChar**: place where this token starts
- * - **length**: length of this token
- * - **tokenType**: token type
- * - **tokenModifier**: token modifier
- * */
+ * @param source The source file.
+ * @returns Diagnostics to send to client.
+ */
+async function sendDiagnostics(source: doc.TextDocument): Promise<lsp.Diagnostic[]> {
+	if (diagnostics === null) {
+		// Hasn't processed yet. Call functions to process this.
+		computeSemanticTokens(source.uri);
+	}
+
+	const diags: lsp.Diagnostic[] = [];
+	for (let x of diagnostics!) {
+		const diagnostic: lsp.Diagnostic = {
+			severity: x.level,
+			range: {
+				start: x.start,
+				end: x.end,
+			},
+			message: x.message,
+			source: "x86"
+		};
+		if (x.relatedInfo.length) {
+			diagnostic.relatedInformation = [];
+			for (let info of x.relatedInfo) {
+				diagnostic.relatedInformation.push({
+					location: {
+						uri: source.uri,
+						range: Object.assign({}, diagnostic.range)
+					},
+					message: info,
+				});
+			}
+		}
+		diags.push(diagnostic);
+	}
+
+	// Sent. Let's flush all diagnostics.
+	diagnostics = null;
+	return diags;
+}
+
+function splitLine(tokens: Token[]): Instruction[] {
+	// Split each line.
+	let lines = [];
+	let curInst = [];
+	let curLine = 0;
+	for (let x of tokens) {
+		if (x.line_no !== curLine) {
+			curLine = x.line_no;
+			lines.push(curInst);
+		}
+
+		// Remove comments.
+		if (x.type !== tokenTypes.comment)
+			curInst.push(x);
+	}
+	// The final push is not done yet, do it now
+	lines.push(curInst);
+
+	return lines.map((x) => new Instruction(x));
+}
+
+let labels = [];
+
+// We don't need AST, as x86 is quite straightforward.
+function semanticsAnalysis(tokens: Token[]) {
+	let inst = splitLine(tokens);
+	if (diagnostics === null)
+		diagnostics = [];
+
+	for (let x of inst) {
+		let type = x.head().type;
+
+		// An instruction.
+		if (type === tokenTypes.keyword) {
+
+		}
+
+		// Probably a label.
+		if (type === -1) {
+			// Expect a colon and nothing else.
+			if (x.length() > 2) {
+				diagnostics.push(new Diagnostic(lsp.DiagnosticSeverity.Error, "unexpected content after label", x.operands[2], x.operands[x.length() - 1]));
+				continue;
+			}
+
+			// Must have a colon after it
+			if (x.length() === 1 || x.operands[1].value !== ":") {
+				diagnostics.push(new Diagnostic(lsp.DiagnosticSeverity.Error, "missing semicolon for labels", x.head()));
+				continue;
+			}
+
+			labels.push(x.head());
+			x.head().type = tokenTypes.function;
+		}
+	}
+}
+
 function computeSemanticTokens(uri: string) {
 	const text = documents.get(uri)?.getText()!;
 
-	let tokens: number[] = [];
+	let tokens: Token[] = [];
 	let lines = text.split("\n");
 
 	// We implement a small tokenizer.
@@ -237,7 +336,7 @@ function computeSemanticTokens(uri: string) {
 
 			// comment
 			if (remains.startsWith(";")) {
-				tokens.push(line_no, i, remains.length, tokenTypes.comment, 0);
+				tokens.push(new Token(line_no, i, remains, tokenTypes.comment, 0));
 				break;
 			}
 
@@ -245,7 +344,7 @@ function computeSemanticTokens(uri: string) {
             let matchImm = remains.match(/^\d+/);
             if (matchImm) {
                 let str = matchImm[0];
-                tokens.push(line_no, i, str.length, tokenTypes.number, 0);
+                tokens.push(new Token(line_no, i, str, tokenTypes.number, 0));
                 i += str.length;
                 continue;
             }
@@ -254,31 +353,42 @@ function computeSemanticTokens(uri: string) {
             let matchId = remains.match(/^[_\w]+/);
             if (matchId) {
                 let str = matchId[0];
-				tokens.push(line_no, i, str.length);
+				let type: number;
 
 				if (instructions.includes(str))
-				 	tokens.push(tokenTypes.keyword, 0);
+				 	type = tokenTypes.keyword;
 				
 				else if (registers.includes(str))
-					tokens.push(tokenTypes.variable, 0);
+					type = tokenTypes.variable;
 
 				else if (types.includes(str))
-					tokens.push(tokenTypes.type, 0);
+					type = tokenTypes.type;
 
 				else if (directives.includes(str))
-					tokens.push(tokenTypes.macro, 0);
+					type = tokenTypes.macro;
 
-				else
-					tokens.push(tokenTypes.function, 0);
+				else // Unknown type, any identifier is possible
+					type = -1;
 
+				tokens.push(new Token(line_no, i, str, type, 0));
                 i += str.length;
                 continue;
             }
+
+			// A single character, as an operator
+			let x = remains.charAt(0);
+
+			if (x === "[" || x === "]" || x === ":") {
+				tokens.push(new Token(line_no, i, x, tokenTypes.operator, 0));
+				// [[fallthrough]]
+			}
 
             // Unrecognized character, just skip
             i++;
         }
 	});
+
+	semanticsAnalysis(tokens);
 	
 	// we must convert them to relative position.
 	// the original array is already sorted according to (line, char_start).
@@ -287,20 +397,17 @@ function computeSemanticTokens(uri: string) {
 
 	let relative = [];
 
-	for (let i = 0; i < tokens.length; i += 5) {
-		let line_no = tokens[i];
-		let start = tokens[i + 1];
-
-		let deltaLine = line_no - currentLine;
+	for (let x of tokens) {
+		let deltaLine = x.line_no - currentLine;
 		if (deltaLine > 0) {
-			currentLine = line_no;
+			currentLine = x.line_no;
 			currentChar = 0;
 		}
 
-		let deltaStart = start - currentChar;
-		currentChar = start;
+		let deltaStart = x.start - currentChar;
+		currentChar = x.start;
 
-		relative.push(deltaLine, deltaStart, tokens[i + 2], tokens[i + 3], tokens[i + 4]);
+		relative.push(deltaLine, deltaStart, x.value.length, x.type, x.modif);
 	}
 	return relative;
 }

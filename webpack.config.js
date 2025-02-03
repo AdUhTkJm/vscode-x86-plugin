@@ -10,7 +10,7 @@ const path = require('path');
 /** @type WebpackConfig */
 const extensionConfig = {
   target: 'node',
-	mode: 'development',
+	mode: 'production',
   entry: {
     server: './server/server.ts',
     client: './client/main.ts'
